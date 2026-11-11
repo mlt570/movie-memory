@@ -36,7 +36,7 @@ cp .env.example .env # then fill in the values (see below)
 | `GOOGLE_CLIENT_ID`     | yes      | Google OAuth client id                                                                        |
 | `GOOGLE_CLIENT_SECRET` | yes      | Google OAuth client secret                                                                    |
 | `OPENAI_API_KEY`       | yes      | OpenAI API key (server-only, never sent to the browser). A *restricted* key needs permission for model requests (scope `model.request`), or calls fail with 401 |
-| `OPENAI_MODEL`         | no       | Defaults to `gpt-4.1-mini`. Must be a chat model that accepts `temperature` (e.g. the GPT-4.1 family) |
+| `OPENAI_MODEL`         | no       | Defaults to `gpt-5.4-mini`. Must support the Responses API's `web_search` tool |
 
 **Google OAuth:** in Google Cloud Console → APIs & Services → Credentials, create an
 "OAuth client ID" of type *Web application* with:
@@ -99,7 +99,7 @@ src/
 │   ├── facts/
 │   │   ├── fact-service.ts       ★ Cache window, generation lock, fallback (pure, injectable)
 │   │   └── index.ts              Wires the service to Prisma + OpenAI
-│   ├── openai.ts                 OpenAI call with timeout/retry bounds
+│   ├── openai.ts                 OpenAI call (Responses API + web search), timeout/retry bounds
 │   ├── validation.ts             Zod schema for movie titles (server-side source of truth)
 │   ├── api-types.ts              Response/error contract for /api/fact
 │   └── prisma.ts                 Prisma client singleton
@@ -207,7 +207,7 @@ Why this approach over the alternatives:
 | Transaction / advisory lock held across the OpenAI call | Holds a pooled connection and an open transaction for seconds per request; Prisma's interactive transactions have short default timeouts; session-level advisory locks are unsafe with a connection pool. |
 | Unique constraint per 60s bucket      | Fixed buckets don't match a sliding "less than 60s old" window (facts at 0:59 and 1:00 land in different buckets). |
 
-**3. Failure handling.** Each OpenAI attempt times out after 8s with one retry, and the whole
+**3. Failure handling.** Each OpenAI attempt times out after 15s with one retry, and the whole
 generation is capped at 20s by the service (the request is aborted). On any failure
 (timeout, 5xx, 429, empty response, missing key) the service logs the error server-side and returns
 the most recent fact with `source: "stale"`. With no fact to fall back on, the API returns a
@@ -277,7 +277,8 @@ database checks.
 | Signed in: `/` → `/dashboard`, `/onboarding` → `/dashboard`, `/dashboard` 200 | ✅ |
 | Dashboard shows the Google name, email, photo (via the image optimizer, 200) and the movie | ✅ |
 | Signed out: `/` 200 landing, `/dashboard` and `/onboarding` → `/`, `/api/fact` 401 | ✅ |
-| First `GET /api/fact` calls OpenAI, stores one row, returns `generated` (~1.5s) | ✅ |
+| First `GET /api/fact` calls OpenAI (`gpt-5.4-mini` + web search), stores one row, returns `generated` (~3.5–4.5s) | ✅ |
+| Facts are about the selected movie, including a 2025 release (*KPop Demon Hunters*: release date, directors, soundtrack records) | ✅ |
 | Repeats within 60s return `cache` with the same fact (~0.05–0.6s), no new rows, including at ~57s | ✅ |
 | After 61s, 5 simultaneous requests: exactly one OpenAI call; the other four get `refreshing` immediately | ✅ |
 | Next request after the window: new fact `generated` | ✅ |
@@ -330,14 +331,17 @@ exactly that kind of reasoning about data modeling, concurrency and failure mode
 - **Fact history grows without bound** (append-only).
 - **No per-user rate limit** beyond the 60s cache: a user can't cause more than one OpenAI call per
   minute per movie, but there's no global spend cap.
-- **First-fact waiters can wait up to 30s** if OpenAI is very slow (normally about 1–3s).
+- **First-fact waiters can wait up to 30s** if OpenAI is very slow (normally about 3–5s with web search).
 - **Google consent screen in "Testing" mode** only lets listed test users sign in. Other
   accounts see the sign-in error message.
-- **Model knowledge cutoff.** `gpt-4.1-mini` was trained on data up to mid-2024, so it doesn't
-  know newer films (e.g. *KPop Demon Hunters*, 2025). The prompt makes it say so and give a
-  general film fact instead of inventing one. That's honest, but less fun. A newer model can be
-  set via `OPENAI_MODEL` only if it accepts `temperature`; reasoning models that reject it would
-  fail on every call, which the app treats as an OpenAI failure (fallback or 503).
+- **Web search adds latency and cost.** Facts come from `gpt-5.4-mini` with OpenAI's built-in
+  `web_search` tool, so they stay accurate for films newer than the model's training data
+  (e.g. *KPop Demon Hunters*, 2025). Without search, small models said they didn't recognise it
+  or got details wrong. The price is ~3–5s per fresh fact and a per-search fee; the 60s cache and
+  the per-user lease keep that to at most one search per user + movie per minute.
+- **Facts depend on web content.** The model is told to treat the title as data and reply in
+  plain text; any markdown citation links it still adds are stripped, and React escapes the
+  output. A misleading web page could still produce a wrong fact.
 - **Movie titles are free text** and aren't checked against a movie database, so typos and
   unknown titles are only caught by the model's reply.
 
