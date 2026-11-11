@@ -1,0 +1,99 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Auth (shape required by @next-auth/prisma-adapter)
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime? @db.Timestamptz(3)
+  image         String?
+
+  // The user's single favorite movie. NULL means onboarding is not finished,
+  // which is how we tell "first-time" users apart from returning ones.
+  favoriteMovie String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  accounts  Account[]
+  sessions  Session[]
+  facts     MovieFact[]
+  factLocks FactGenerationLock[]
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Movie facts
+// ---------------------------------------------------------------------------
+
+// Every generated fact is kept (append-only history). The cache is simply
+// "the newest row for this user + movie", so no separate cache table is needed.
+model MovieFact {
+  id        String   @id @default(cuid())
+  userId    String
+  // Snapshot of the title the fact was generated for. If the user's favorite
+  // movie ever changes, old facts no longer match and are not served.
+  movie     String
+  content   String   @db.Text
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Serves the hot query: newest fact for (userId, movie).
+  @@index([userId, movie, createdAt(sort: Desc)])
+}
+
+// "Generation in progress" lease. At most one row per (user, movie) can exist
+// thanks to the composite primary key, so inserting the row *is* acquiring the
+// lock. `lockedUntil` makes the lease self-healing if a holder crashes, and
+// `token` ensures a holder only ever releases its own lease.
+model FactGenerationLock {
+  userId      String
+  movie       String
+  token       String
+  lockedUntil DateTime @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, movie])
+}
