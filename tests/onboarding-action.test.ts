@@ -48,9 +48,21 @@ describe("saveFavoriteMovie (onboarding server action)", () => {
     const user = await createUser("a@example.com", "Heat");
     vi.mocked(getSessionUserId).mockResolvedValue(user.id);
 
-    await saveFavoriteMovie(initial, form("Something Else")).catch(() => {});
+    const error = await saveFavoriteMovie(initial, form("Something Else")).catch((e) => e);
 
+    // It ran to completion (redirected), it just didn't write anything.
+    expect(redirectTarget(error)).toBe("/dashboard");
     expect((await prisma.user.findUniqueOrThrow({ where: { id: user.id } })).favoriteMovie).toBe("Heat");
+  });
+
+  it("returns a validation error (not a crash) for a title with a NUL byte", async () => {
+    const user = await createUser("a@example.com", null);
+    vi.mocked(getSessionUserId).mockResolvedValue(user.id);
+
+    const state = await saveFavoriteMovie(initial, form("Heat\u0000"));
+
+    expect(state.error).toMatch(/control characters/);
+    expect((await prisma.user.findUniqueOrThrow({ where: { id: user.id } })).favoriteMovie).toBeNull();
   });
 
   it("redirects to the landing page when signed out", async () => {

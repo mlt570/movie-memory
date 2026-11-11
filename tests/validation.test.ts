@@ -25,4 +25,19 @@ describe("parseMovieTitle", () => {
     expect(parseMovieTitle(undefined)).toMatchObject({ ok: false });
     expect(parseMovieTitle(42)).toMatchObject({ ok: false });
   });
+
+  it("rejects control characters such as NUL (Postgres can't store them)", () => {
+    expect(parseMovieTitle("Heat\u0000")).toMatchObject({ ok: false });
+    expect(parseMovieTitle("Heat\u0007")).toMatchObject({ ok: false });
+  });
+
+  it("rejects titles with no visible letters or digits", () => {
+    expect(parseMovieTitle("​​")).toMatchObject({ ok: false });
+    expect(parseMovieTitle("...")).toMatchObject({ ok: false });
+  });
+
+  it("accepts non-Latin and punctuated titles", () => {
+    expect(parseMovieTitle("千と千尋の神隠し")).toMatchObject({ ok: true });
+    expect(parseMovieTitle("WALL·E: 2008!")).toMatchObject({ ok: true });
+  });
 });

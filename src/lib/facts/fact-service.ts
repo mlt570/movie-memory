@@ -5,15 +5,26 @@ import { Prisma, type PrismaClient } from "@prisma/client";
 export const FACT_CACHE_WINDOW_MS = 60_000;
 
 /**
- * How long a "generation in progress" lease lasts. Must comfortably exceed the
- * worst-case OpenAI call (see lib/openai.ts) so a live holder never loses its
+ * Hard deadline for one generation, enforced here (not just by the OpenAI
+ * client) so the lease below can never expire while its holder is working,
+ * whatever retries or Retry-After delays happen inside the generator.
+ */
+export const GENERATION_TIMEOUT_MS = 20_000;
+
+/**
+ * How long a "generation in progress" lease lasts. It exceeds the generation
+ * deadline plus a margin for the DB writes, so a live holder never loses its
  * lease; if the holder crashes, the lease simply expires and can be taken over.
  */
 export const FACT_LOCK_TTL_MS = 30_000;
 
-/** When a request has no fact to show and another request is generating one, it polls for the result. */
+/**
+ * When a request has no fact to show and another request is generating one,
+ * it polls for the result for up to one full lease, the longest the other
+ * request can legitimately take.
+ */
 export const WAIT_POLL_INTERVAL_MS = 500;
-export const WAIT_MAX_ATTEMPTS = 30; // ~15s, longer than one OpenAI call
+export const WAIT_MAX_ATTEMPTS = Math.ceil(FACT_LOCK_TTL_MS / WAIT_POLL_INTERVAL_MS);
 
 export type Fact = {
   id: string;
@@ -25,11 +36,12 @@ export type Fact = {
 /**
  * - "cache":     a fact less than 60s old (no OpenAI call was made)
  * - "generated": a brand-new fact from OpenAI
- * - "stale":     the most recent fact, older than 60s, returned because a new
- *                one couldn't be produced right now (OpenAI failed, or another
- *                request is already generating it)
+ * - "refreshing": the most recent fact, older than 60s, returned immediately
+ *                 because another request is already generating a new one
+ * - "stale":      the most recent fact, older than 60s, returned because
+ *                 generating a new one failed (OpenAI error or timeout)
  */
-export type FactSource = "cache" | "generated" | "stale";
+export type FactSource = "cache" | "generated" | "refreshing" | "stale";
 
 export type FactResult = { fact: Fact; source: FactSource };
 
@@ -50,7 +62,10 @@ export class FactUnavailableError extends Error {
 
 export type FactServiceDeps = {
   db: PrismaClient;
-  generateFact: (movie: string) => Promise<string>;
+  /** Produces a fact. Should stop work when `signal` aborts (the deadline). */
+  generateFact: (movie: string, signal: AbortSignal) => Promise<string>;
+  /** Defaults to GENERATION_TIMEOUT_MS; tests shorten it. Keep it below FACT_LOCK_TTL_MS. */
+  generationTimeoutMs?: number;
   /** Injectable clock so the 60s window can be tested deterministically. */
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
@@ -62,6 +77,7 @@ const FACT_SELECT = { id: true, movie: true, content: true, createdAt: true } as
 export function createFactService({
   db,
   generateFact,
+  generationTimeoutMs = GENERATION_TIMEOUT_MS,
   now = () => new Date(),
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   logError = (message, error) => console.error(message, error),
@@ -112,8 +128,29 @@ export function createFactService({
   }
 
   async function releaseLock(userId: string, movie: string, token: string): Promise<void> {
-    // Matching on the token means we never delete a lease someone else holds.
-    await db.factGenerationLock.deleteMany({ where: { userId, movie, token } });
+    try {
+      // Matching on the token means we never delete a lease someone else holds.
+      await db.factGenerationLock.deleteMany({ where: { userId, movie, token } });
+    } catch (error) {
+      // Don't turn a successful request into an error: the lease expires on its own.
+      logError("Failed to release fact generation lock", error);
+    }
+  }
+
+  /** Run the generator, rejecting once the deadline passes even if it ignores the signal. */
+  function generateWithDeadline(movie: string): Promise<string> {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error(`Fact generation timed out after ${generationTimeoutMs}ms`);
+        controller.abort(error);
+        reject(error);
+      }, generationTimeoutMs);
+    });
+    return Promise.race([generateFact(movie, controller.signal), deadline]).finally(() =>
+      clearTimeout(timer),
+    );
   }
 
   async function isLockHeld(userId: string, movie: string): Promise<boolean> {
@@ -150,7 +187,7 @@ export function createFactService({
 
       let content: string;
       try {
-        content = await generateFact(movie);
+        content = await generateWithDeadline(movie);
       } catch (error) {
         // 3. OpenAI failed: fall back to the most recent fact, if any.
         logError("Fact generation failed", error);
@@ -170,8 +207,8 @@ export function createFactService({
 
   /**
    * Another request is generating a fact for this user + movie right now.
-   * - If we have an older fact, return it immediately rather than making the
-   *   user wait; the next request will see the new one.
+   * - If we have an older fact, return it immediately ("refreshing") rather
+   *   than making the user wait; the next request will see the new one.
    * - If this is the very first fact (nothing to show), poll briefly for the
    *   other request's result.
    */
@@ -180,7 +217,7 @@ export function createFactService({
     movie: string,
     latest: Fact | null,
   ): Promise<FactResult> {
-    if (latest) return { fact: latest, source: "stale" };
+    if (latest) return { fact: latest, source: "refreshing" };
 
     for (let attempt = 0; attempt < WAIT_MAX_ATTEMPTS; attempt++) {
       await sleep(WAIT_POLL_INTERVAL_MS);

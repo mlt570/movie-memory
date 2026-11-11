@@ -19,7 +19,8 @@ export function Avatar({ name, image }: { name: string; image: string | null }) 
       .split(/\s+/)
       .filter(Boolean)
       .slice(0, 2)
-      .map((part) => part[0]!.toUpperCase())
+      // Array.from splits by code point, so emoji aren't cut in half.
+      .map((part) => Array.from(part)[0]!.toUpperCase())
       .join("") || "?";
 
   return (

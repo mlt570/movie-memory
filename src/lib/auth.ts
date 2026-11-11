@@ -25,6 +25,22 @@ export const authOptions: NextAuthOptions = {
       return session;
     },
   },
+  events: {
+    // The adapter copies name/photo from Google only when the user is first
+    // created. Refresh them on later sign-ins so the dashboard stays current
+    // (including clearing a photo the user has since removed).
+    async signIn({ user, profile, isNewUser }) {
+      if (isNewUser || !profile) return;
+      try {
+        await prisma.user.update({
+          where: { id: user.id },
+          data: { name: profile.name ?? null, image: profile.image ?? null },
+        });
+      } catch (error) {
+        console.error("Failed to refresh Google profile", error); // never block sign-in
+      }
+    },
+  },
 };
 
 /** The signed-in user's id, or null. The only trusted source of identity. */

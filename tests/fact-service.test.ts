@@ -74,7 +74,7 @@ describe("60-second cache window", () => {
 
     expect(result.source).toBe("generated");
     expect(result.fact.movie).toBe("Heat");
-    expect(generateFact).toHaveBeenLastCalledWith("Heat");
+    expect(generateFact).toHaveBeenLastCalledWith("Heat", expect.any(AbortSignal));
   });
 });
 
@@ -116,7 +116,7 @@ describe("burst / concurrency protection", () => {
     expect(generateFact).toHaveBeenCalledTimes(2); // 1 initial + 1 for the burst
     expect(results.filter((r) => r.source === "generated")).toHaveLength(1);
     for (const r of results.filter((r) => r.source !== "generated")) {
-      expect(r.source).toBe("stale");
+      expect(r.source).toBe("refreshing");
       expect(r.fact.id).toBe(old.fact.id);
     }
     expect(await prisma.movieFact.count()).toBe(2);
@@ -139,6 +139,68 @@ describe("burst / concurrency protection", () => {
     expect(result.source).toBe("generated");
     expect(generateFact).toHaveBeenCalledTimes(1);
     expect(await prisma.factGenerationLock.count()).toBe(0); // released afterwards
+  });
+
+  it("re-checks the cache after locking, so a request that raced a finished generation doesn't generate again", async () => {
+    const { clock, generateFact } = setup();
+    const user = await createUser("a@example.com");
+    await prisma.movieFact.create({
+      data: { userId: user.id, movie: "Inception", content: "Old", createdAt: clock.now() },
+    });
+    clock.advance(FACT_CACHE_WINDOW_MS + 1);
+
+    // Simulate another request finishing its generation right after this
+    // request's first read (which saw only the stale fact) and before it locks.
+    let raced = false;
+    const racingDb = new Proxy(prisma, {
+      get(target, prop, receiver) {
+        if (prop !== "movieFact") return Reflect.get(target, prop, receiver);
+        return {
+          ...target.movieFact,
+          findFirst: async (args: Parameters<typeof target.movieFact.findFirst>[0]) => {
+            const result = await target.movieFact.findFirst(args);
+            if (!raced) {
+              raced = true;
+              await target.movieFact.create({
+                data: { userId: user.id, movie: "Inception", content: "Fresh from the other request", createdAt: clock.now() },
+              });
+            }
+            return result;
+          },
+          create: target.movieFact.create.bind(target.movieFact),
+        };
+      },
+    }) as typeof prisma;
+    const service = createFactService({ db: racingDb, generateFact, now: clock.now, logError: () => {} });
+
+    const result = await service.getFactForUser(user.id);
+
+    expect(result).toMatchObject({ source: "cache", fact: { content: "Fresh from the other request" } });
+    expect(generateFact).not.toHaveBeenCalled();
+  });
+
+  it("a holder whose lease expired never releases the lease a newer request took over", async () => {
+    const { service, generateFact, clock } = setup();
+    const user = await createUser("a@example.com");
+    const slowA = deferred<string>();
+    const slowB = deferred<string>();
+    generateFact.mockImplementationOnce(() => slowA.promise).mockImplementationOnce(() => slowB.promise);
+
+    const requestA = service.getFactForUser(user.id);
+    await vi.waitFor(() => expect(generateFact).toHaveBeenCalledTimes(1));
+
+    clock.advance(FACT_LOCK_TTL_MS + 1); // A's lease expires (e.g. A is stuck)
+    const requestB = service.getFactForUser(user.id);
+    await vi.waitFor(() => expect(generateFact).toHaveBeenCalledTimes(2)); // B took over
+
+    slowA.resolve("A's late fact");
+    await requestA;
+    const lock = await prisma.factGenerationLock.findFirstOrThrow();
+    expect(lock.lockedUntil.getTime()).toBe(clock.now().getTime() + FACT_LOCK_TTL_MS); // B's lease survives
+
+    slowB.resolve("B's fact");
+    await requestB;
+    expect(await prisma.factGenerationLock.count()).toBe(0);
   });
 
   it("gives up with a 'busy' error if another request holds the lock for too long", async () => {
@@ -197,6 +259,52 @@ describe("OpenAI failure handling", () => {
 
     expect(result.source).toBe("generated");
     expect(await prisma.factGenerationLock.count()).toBe(0);
+  });
+
+  it("enforces a hard deadline on generation, even if the generator hangs", async () => {
+    const clock = createFakeClock();
+    let receivedSignal: AbortSignal | undefined;
+    const generateFact = vi.fn((_movie: string, signal: AbortSignal) => {
+      receivedSignal = signal;
+      return new Promise<string>(() => {}); // never settles
+    });
+    const service = createFactService({
+      db: prisma,
+      generateFact,
+      generationTimeoutMs: 50,
+      now: clock.now,
+      logError: () => {},
+    });
+    const user = await createUser("a@example.com");
+
+    const error = await service.getFactForUser(user.id).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(FactUnavailableError);
+    expect(receivedSignal?.aborted).toBe(true); // the OpenAI request gets cancelled
+    expect(await prisma.factGenerationLock.count()).toBe(0);
+  });
+
+  it("still returns a generated fact if releasing the lock fails", async () => {
+    const { clock, generateFact } = setup();
+    const user = await createUser("a@example.com");
+    const flakyDb = new Proxy(prisma, {
+      get(target, prop, receiver) {
+        if (prop !== "factGenerationLock") return Reflect.get(target, prop, receiver);
+        return {
+          create: target.factGenerationLock.create.bind(target.factGenerationLock),
+          deleteMany: async () => {
+            throw new Error("connection reset");
+          },
+        };
+      },
+    }) as typeof prisma;
+    const logError = vi.fn();
+    const service = createFactService({ db: flakyDb, generateFact, now: clock.now, logError });
+
+    const result = await service.getFactForUser(user.id);
+
+    expect(result.source).toBe("generated");
+    expect(logError).toHaveBeenCalledWith("Failed to release fact generation lock", expect.any(Error));
   });
 
   it("tells waiting requests when the in-flight generation failed", async () => {

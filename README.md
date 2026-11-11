@@ -65,7 +65,7 @@ npm run dev        # http://localhost:3000
 ### Quality checks
 
 ```bash
-npm test           # Vitest: 28 tests against a real Postgres test database
+npm test           # Vitest: 36 tests against a real Postgres test database
 npm run lint       # ESLint
 npm run typecheck  # tsc --noEmit
 npm run build      # production build
@@ -113,12 +113,15 @@ tests/                            Vitest suites (service, route, action, validat
    when signed out. Onboarding redirects to the dashboard if a movie already exists, and the
    dashboard redirects to onboarding if it doesn't.
 3. **Onboarding.** The form posts to a Server Action that re-checks the session (Server Actions are
-   public endpoints), validates with Zod (trim, collapse whitespace, 1–100 chars), and saves with
+   public endpoints), validates with Zod (trim, collapse whitespace, 1–100 chars, no control characters, must
+   contain a letter or digit), and saves with
    `updateMany({ where: { id, favoriteMovie: null } })` so a replayed submission can't overwrite an
    existing choice.
 4. **Dashboard.** Server-rendered from the DB (name, email, photo, movie) with fallbacks for a
    missing name (email, then "Movie fan") and a missing photo (initials). The fact card is a small
-   client component that calls `GET /api/fact` and renders loading, error and "stale" states.
+   client component that calls `GET /api/fact`. It renders loading, error, "refreshing" and
+   "stale" states, and sends the user back to `/` on a 401. Name and photo are refreshed from
+   Google on every sign-in (the adapter alone only copies them when the account is created).
 5. **Facts.** `GET /api/fact` takes **no parameters**. It reads the user id from the session and
    passes it to `factService.getFactForUser(userId)`.
 
@@ -148,7 +151,7 @@ Design decisions:
 ### The fact service (Variant A core)
 
 `lib/facts/fact-service.ts` is a plain function of its dependencies
-(`db`, `generateFact`, `now`, `sleep`), with no Next.js imports. That makes it straightforward to
+(`db`, `generateFact`, `now`, `sleep`, `generationTimeoutMs`), with no Next.js imports. That makes it straightforward to
 test with a fake clock and a fake OpenAI.
 
 ```
@@ -159,13 +162,14 @@ getFactForUser(userId)
  ├─ try to acquire lease for (userId, movie)
  │   ├─ acquired:
  │   │   ├─ re-read latest; fresh now? → "cache"        (double-checked locking)
- │   │   ├─ call OpenAI
+ │   │   ├─ call OpenAI, with a hard 20s deadline (aborts the request)
  │   │   │   ├─ ok   → insert fact → "generated"
  │   │   │   └─ fail → have any fact? → "stale" : FactUnavailableError → 503
- │   │   └─ finally: release lease (only if the token is still ours)
+ │   │   └─ finally: release lease (only if the token is still ours; a failed
+ │   │      release is logged, not surfaced, because the lease expires anyway)
  │   └─ not acquired (someone else is generating):
- │       ├─ have an older fact? → return it immediately as "stale"
- │       └─ no fact at all (very first one) → poll ~15s for the other request's result
+ │       ├─ have an older fact? → return it immediately as "refreshing"
+ │       └─ no fact at all (very first one) → poll for up to one lease (30s)
  │           ├─ fact appears        → "cache"
  │           ├─ lease released, no fact → the other request failed → 503
  │           └─ timeout             → 503 ("still being written")
@@ -185,8 +189,10 @@ getFactForUser(userId)
   a lease someone else now holds.
 - *Double-check after acquiring:* closes the window where request B reads "stale", request A
   generates and releases, then B acquires. Without the re-read, B would generate a second fact.
-- *Lease length (30s) > worst-case OpenAI call* (8s timeout × 2 attempts), so a live holder never
-  loses its lease.
+- *Lease length (30s) > generation deadline (20s) + DB writes*, so a live holder never loses its
+  lease. The deadline is enforced by the service itself (`Promise.race` with an `AbortSignal`),
+  not just by the OpenAI client's settings. That matters because the SDK honors a server
+  `Retry-After` of up to 60s between retries, which would otherwise outlive the lease.
 
 Why this approach over the alternatives:
 
@@ -196,8 +202,9 @@ Why this approach over the alternatives:
 | Transaction / advisory lock held across the OpenAI call | Holds a pooled connection and an open transaction for seconds per request; Prisma's interactive transactions have short default timeouts; session-level advisory locks are unsafe with a connection pool. |
 | Unique constraint per 60s bucket      | Fixed buckets don't match a sliding "less than 60s old" window (facts at 0:59 and 1:00 land in different buckets). |
 
-**3. Failure handling.** The OpenAI client has an 8s timeout and one retry. On any failure
-(timeout, 5xx, empty response, missing key) the service logs the error server-side and returns
+**3. Failure handling.** Each OpenAI attempt times out after 8s with one retry, and the whole
+generation is capped at 20s by the service (the request is aborted). On any failure
+(timeout, 5xx, 429, empty response, missing key) the service logs the error server-side and returns
 the most recent fact with `source: "stale"`. With no fact to fall back on, the API returns a
 `503` with a friendly message. Internal error details never reach the client. The lease is always
 released in `finally`, so the next request can retry immediately.
@@ -215,28 +222,40 @@ share the same movie and the other user's fact is fresh.
 - The movie title is user input sent to an LLM. It's JSON-encoded in the user message and the
   system prompt says to treat it as data. Output is rendered as text, so React escapes it.
 - `/api/fact` responses are `Cache-Control: private, no-store`.
+- Verified on a production build: the browser bundle contains no secret values, no Prisma or
+  OpenAI code, and no Zod (client components import limits from the dependency-free
+  `lib/movie-title.ts`).
+- Sign-in errors (`/?error=…`) show a fixed message; the parameter is never echoed.
+- Profile photos are optimized only from `*.googleusercontent.com`; other hosts are rejected.
 
 ### Testing
 
-28 tests in `tests/`, run against a **real Postgres** test database. The concurrency guarantees
+36 tests in `tests/`, run against a **real Postgres** test database. The concurrency guarantees
 depend on real Postgres behavior (unique violations, row-lock re-checks), so mocking the DB would
 test nothing.
 
 - `fact-service.test.ts`: cache window (fresh, 59.999s, exactly 60s, per-movie); concurrency
   (5 simultaneous first requests → 1 OpenAI call and 1 row; a burst during regeneration serves the
-  stale fact; expired-lease takeover; "busy" timeout); OpenAI failure (stale fallback, no-cache
-  error, lease released after failure, waiters told when the holder fails); authorization (never
-  another user's fact; no movie → error).
+  previous fact as "refreshing"; double-check after locking, using a simulated race; expired-lease
+  takeover; a late holder can't release a newer holder's lease; "busy" timeout); OpenAI failure
+  (stale fallback, no-cache error, hard deadline aborts a hung generator, lease released after
+  failure, a failed release doesn't fail the request, waiters told when the holder fails);
+  authorization (never another user's fact; no movie → error).
 - `api-fact-route.test.ts`: the real route handler + service + DB, with only the session and
   OpenAI mocked: 401 when signed out, users only see their own facts, 409, stale fallback, and a
   friendly 503 that doesn't leak internals.
-- `onboarding-action.test.ts`: server-side validation, saves only for the session user, never
-  overwrites, redirects when signed out.
-- `validation.test.ts`: trimming, whitespace collapsing, length bounds, non-string input.
+- `onboarding-action.test.ts`: server-side validation (including a NUL byte, which Postgres
+  can't store), saves only for the session user, never overwrites, redirects when signed out.
+- `validation.test.ts`: trimming, whitespace collapsing, length bounds, non-string input,
+  control and invisible-only characters, non-Latin titles.
 
 I also checked that the suite actually catches regressions by breaking the code on purpose:
-changing `<` to `<=` in the cache window, removing the lock, and dropping the `userId` filter
-each make the relevant tests fail.
+changing `<` to `<=` in the cache window, removing the lock, dropping the `userId` filter,
+removing the post-lock re-check, and releasing without matching the token each make the
+relevant tests fail.
+
+What the tests don't cover: the real NextAuth session lookup (tests mock `getSessionUserId`)
+and the real OpenAI API. Those are covered by the manual end-to-end check below.
 
 ---
 
@@ -253,7 +272,7 @@ exactly that kind of reasoning about data modeling, concurrency and failure mode
 - **DB lease vs. simpler locks.** Slightly more code than an in-memory mutex, but correct across
   multiple server instances and self-healing after crashes. Cost: a few extra small queries on a
   cache miss (not on a cache hit).
-- **Waiters get the stale fact immediately** rather than waiting for the new one. Faster UX for
+- **Waiters get the previous fact immediately** (`"refreshing"`) rather than waiting for the new one. Faster UX for
   bursts. The new fact shows up on the next request. Only the very first fact (nothing to show)
   makes waiters poll.
 - **Polling vs. notifications for waiters.** Polling every 500ms is simple and stateless.
@@ -271,6 +290,18 @@ exactly that kind of reasoning about data modeling, concurrency and failure mode
 - **Cache Components disabled.** Next 16 scaffolds with it on, but every page here is per-user
   and dynamic, so there's nothing to prerender. The classic model is simpler to reason about.
 
+## Known limitations
+
+- **Clock skew across instances** shifts the 60s window and lease expiry by the skew (see above).
+- **Lock rows from crashed requests** stay in the table until the next request for that
+  user + movie takes them over. They're harmless, but nothing deletes them proactively.
+- **Fact history grows without bound** (append-only).
+- **No per-user rate limit** beyond the 60s cache: a user can't cause more than one OpenAI call per
+  minute per movie, but there's no global spend cap.
+- **First-fact waiters can wait up to 30s** if OpenAI is very slow (normally about 1–3s).
+- **Google consent screen in "Testing" mode** only lets listed test users sign in. Other
+  accounts see the sign-in error message.
+
 ## What I'd improve with 2 more hours
 
 - **Edit favorite movie** from the dashboard (the data model already handles it: facts are keyed
@@ -285,6 +316,9 @@ exactly that kind of reasoning about data modeling, concurrency and failure mode
 
 ## AI usage
 
+> **Draft for the author's review.** These bullets record what happened during development;
+> edit them into your own words before submitting.
+
 - Used an AI coding assistant (Claude) to scaffold the project, write the first drafts of
   modules, tests and this README, and run the lint/typecheck/test/build loop.
 - The AI proposed the architecture (DB lease vs. alternatives, cache = facts table,
@@ -294,5 +328,9 @@ exactly that kind of reasoning about data modeling, concurrency and failure mode
 - Verification wasn't left to the AI's word: tests run against real Postgres, deliberately
   broken code (mutation checks) confirmed the tests catch regressions, and the production build
   was smoke-tested with `curl` for every redirect and API status code.
+- Ran a separate AI review pass (an agent given the assignment and the code, but not the
+  author's conclusions) as a security and correctness audit. Its confirmed findings were
+  verified against the library source before fixing: lease vs. SDK `Retry-After`, the
+  image host allow-list, NUL bytes in titles, an unguarded lock release, and test gaps.
 - Used the Next.js 16 docs bundled in `node_modules/next/dist/docs` to handle version-specific
   changes (Cache Components default, `proxy` rename).

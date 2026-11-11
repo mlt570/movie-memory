@@ -1,12 +1,15 @@
 import { z } from "zod";
+import { MOVIE_TITLE_MAX_LENGTH, MOVIE_TITLE_MIN_LENGTH } from "@/lib/movie-title";
 
-export const MOVIE_TITLE_MIN_LENGTH = 1; // real titles can be one character, e.g. "M" (1931)
-export const MOVIE_TITLE_MAX_LENGTH = 100;
+export { MOVIE_TITLE_MAX_LENGTH, MOVIE_TITLE_MIN_LENGTH };
 
 /**
  * Server-side source of truth for a favorite-movie title.
- * Trims the input and collapses internal whitespace (tabs, newlines, repeated
- * spaces) before checking the length, so "  The   Matrix\n" becomes "The Matrix".
+ * 1. Trims and collapses whitespace (tabs, newlines, repeated spaces), so
+ *    "  The   Matrix\n" becomes "The Matrix".
+ * 2. Checks the length.
+ * 3. Rejects control characters (e.g. NUL, which Postgres can't store) and
+ *    titles with no visible content (e.g. only zero-width characters).
  */
 export const movieTitleSchema = z
   .string({ error: "Please enter a movie title." })
@@ -18,7 +21,9 @@ export const movieTitleSchema = z
       .max(
         MOVIE_TITLE_MAX_LENGTH,
         `Movie titles must be ${MOVIE_TITLE_MAX_LENGTH} characters or fewer.`,
-      ),
+      )
+      .refine((title) => !/\p{Cc}/u.test(title), "Movie titles can't contain control characters.")
+      .refine((title) => /[\p{L}\p{N}]/u.test(title), "Please enter a movie title."),
   );
 
 export type ParseResult = { ok: true; value: string } | { ok: false; error: string };

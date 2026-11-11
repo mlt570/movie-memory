@@ -1,18 +1,21 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import type { ApiErrorResponse, FactResponse } from "@/lib/api-types";
 
 type FactState =
   | { status: "loading" }
   | { status: "ready"; data: FactResponse }
-  | { status: "error"; message: string };
+  | { status: "error"; message: string }
+  | { status: "unauthenticated" };
 
 const GENERIC_ERROR = "We couldn't load a fact right now. Please try again.";
 
 async function fetchFact(): Promise<FactState> {
   try {
     const res = await fetch("/api/fact", { cache: "no-store" });
+    if (res.status === 401) return { status: "unauthenticated" };
     const body: unknown = await res.json().catch(() => null);
     if (!res.ok) {
       const message = (body as ApiErrorResponse | null)?.error?.message ?? GENERIC_ERROR;
@@ -27,12 +30,19 @@ async function fetchFact(): Promise<FactState> {
 const SOURCE_NOTE: Record<FactResponse["source"], string | null> = {
   generated: null,
   cache: "New facts are available once a minute. This is your latest one.",
+  refreshing: "A new fact is being written. Check back in a few seconds.",
   stale: "We couldn't get a new fact just now, so here's your most recent one.",
 };
 
 export function FactCard() {
   const [state, setState] = useState<FactState>({ status: "loading" });
   const [refreshing, setRefreshing] = useState(false);
+  const router = useRouter();
+
+  // Session expired or signed out in another tab: back to the sign-in page.
+  useEffect(() => {
+    if (state.status === "unauthenticated") router.replace("/");
+  }, [state.status, router]);
 
   useEffect(() => {
     let cancelled = false;
@@ -59,7 +69,7 @@ export function FactCard() {
         <h2 className="text-sm font-medium uppercase tracking-wide text-amber-800 dark:text-amber-300">
           Fun fact
         </h2>
-        {state.status !== "loading" && (
+        {(state.status === "ready" || state.status === "error") && (
           <button
             type="button"
             onClick={refresh}
@@ -71,7 +81,7 @@ export function FactCard() {
         )}
       </div>
 
-      {state.status === "loading" && (
+      {(state.status === "loading" || state.status === "unauthenticated") && (
         <p className="mt-3 animate-pulse text-stone-500">Thinking of something interesting…</p>
       )}
 

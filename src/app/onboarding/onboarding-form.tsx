@@ -1,7 +1,7 @@
 "use client";
 
 import { useActionState } from "react";
-import { MOVIE_TITLE_MAX_LENGTH } from "@/lib/validation";
+import { MOVIE_TITLE_MAX_LENGTH } from "@/lib/movie-title";
 import { saveFavoriteMovie, type OnboardingState } from "./actions";
 
 const initialState: OnboardingState = { error: null, value: "" };
