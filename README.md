@@ -35,8 +35,8 @@ cp .env.example .env # then fill in the values (see below)
 | `NEXTAUTH_SECRET`      | yes      | Random secret for signing cookies: `openssl rand -base64 32`                                   |
 | `GOOGLE_CLIENT_ID`     | yes      | Google OAuth client id                                                                        |
 | `GOOGLE_CLIENT_SECRET` | yes      | Google OAuth client secret                                                                    |
-| `OPENAI_API_KEY`       | yes      | OpenAI API key (server-only, never sent to the browser)                                       |
-| `OPENAI_MODEL`         | no       | Defaults to `gpt-4.1-mini`                                                                    |
+| `OPENAI_API_KEY`       | yes      | OpenAI API key (server-only, never sent to the browser). A *restricted* key needs permission for model requests (scope `model.request`), or calls fail with 401 |
+| `OPENAI_MODEL`         | no       | Defaults to `gpt-4.1-mini`. Must be a chat model that accepts `temperature` (e.g. the GPT-4.1 family) |
 
 **Google OAuth:** in Google Cloud Console → APIs & Services → Credentials, create an
 "OAuth client ID" of type *Web application* with:
@@ -61,6 +61,11 @@ The test suite applies migrations to `TEST_DATABASE_URL` automatically.
 ```bash
 npm run dev        # http://localhost:3000
 ```
+
+Open the app at exactly the `NEXTAUTH_URL` origin (`http://localhost:3000`, not
+`127.0.0.1:3000`). NextAuth stores the OAuth `state` cookie on the origin where sign-in starts,
+and Google returns to the registered redirect URI. Starting on a different origin fails with
+"State cookie was missing".
 
 ### Quality checks
 
@@ -255,7 +260,34 @@ removing the post-lock re-check, and releasing without matching the token each m
 relevant tests fail.
 
 What the tests don't cover: the real NextAuth session lookup (tests mock `getSessionUserId`)
-and the real OpenAI API. Those are covered by the manual end-to-end check below.
+and the real OpenAI API. Those are covered by the end-to-end check below.
+
+### End-to-end verification (production build, real Google OAuth and OpenAI)
+
+Run on 2026-11-11 against `next start`, with a real Google account (consent screen in
+Testing mode) and a real OpenAI key. The browser steps (Google sign-in, onboarding) were done
+by hand. Everything else was driven with `curl` using the real session cookie, plus direct
+database checks.
+
+| Check | Result |
+| ----- | ------ |
+| Google sign-in creates `User` (name, email, photo), `Account` (google) and `Session` rows | ✅ |
+| Google accepts the client and redirect URI; scopes are `openid email profile` only | ✅ |
+| Onboarding saved the favorite movie for the signed-in user | ✅ |
+| Signed in: `/` → `/dashboard`, `/onboarding` → `/dashboard`, `/dashboard` 200 | ✅ |
+| Dashboard shows the Google name, email, photo (via the image optimizer, 200) and the movie | ✅ |
+| Signed out: `/` 200 landing, `/dashboard` and `/onboarding` → `/`, `/api/fact` 401 | ✅ |
+| First `GET /api/fact` calls OpenAI, stores one row, returns `generated` (~1.5s) | ✅ |
+| Repeats within 60s return `cache` with the same fact (~0.05–0.6s), no new rows, including at ~57s | ✅ |
+| After 61s, 5 simultaneous requests: exactly one OpenAI call; the other four get `refreshing` immediately | ✅ |
+| Next request after the window: new fact `generated` | ✅ |
+| Real OpenAI error (unknown model → 404): returns the last fact as `stale`, lock released | ✅ |
+| Real OpenAI error with no fact yet (key lacking permission → 401): friendly 503, no internals leaked | ✅ |
+| Logout (NextAuth sign-out endpoint): session row deleted, cookie cleared, old token → redirect / 401 | ✅ |
+| No lock rows left behind after any of the above | ✅ |
+
+Logout was tested with a temporary second session for the same user, so the tester's browser
+session stayed signed in. Clicking **Log out** in the browser uses the same endpoint.
 
 ---
 
@@ -301,6 +333,13 @@ exactly that kind of reasoning about data modeling, concurrency and failure mode
 - **First-fact waiters can wait up to 30s** if OpenAI is very slow (normally about 1–3s).
 - **Google consent screen in "Testing" mode** only lets listed test users sign in. Other
   accounts see the sign-in error message.
+- **Model knowledge cutoff.** `gpt-4.1-mini` was trained on data up to mid-2024, so it doesn't
+  know newer films (e.g. *KPop Demon Hunters*, 2025). The prompt makes it say so and give a
+  general film fact instead of inventing one. That's honest, but less fun. A newer model can be
+  set via `OPENAI_MODEL` only if it accepts `temperature`; reasoning models that reject it would
+  fail on every call, which the app treats as an OpenAI failure (fallback or 503).
+- **Movie titles are free text** and aren't checked against a movie database, so typos and
+  unknown titles are only caught by the model's reply.
 
 ## What I'd improve with 2 more hours
 
