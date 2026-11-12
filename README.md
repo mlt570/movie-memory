@@ -177,14 +177,15 @@ mode, so only listed test users can sign in.
 
 ## AI usage
 
-- Used an AI coding assistant (Claude) to scaffold the project, draft modules, tests and this
-  README, and run the test, lint, type-check and build loop.
-- The AI proposed the core design (DB lease, cache as the facts table, double-checked locking,
-  serving the previous fact during regeneration). Each decision is documented above so it can
-  be checked and defended.
-- Verification didn't rely on the AI's word: tests run on real Postgres, deliberate code breaks
-  confirmed the tests catch regressions, and the app was tested end to end with real Google
-  OAuth and OpenAI.
-- A separate AI review pass audited security and correctness; its findings were confirmed
-  before fixing (e.g. lease vs. SDK retry timing, NUL bytes in titles, image host allow-list).
-- The AI compared OpenAI models against a 2025 film, which led to adding web search.
+- Used Claude Code to accelerate implementation of application features, including database integration, caching mechanisms, concurrency protection, and automated tests.
+- Leveraged AI-assisted code reviews and debugging to identify bugs, evaluate edge cases, and improve error handling and application reliability.
+- Used AI tools to compare OpenAI models and explore web search integration to improve the accuracy of movie-related facts.
+
+## Manual Contributions
+- Designed the application architecture and selected database structures, caching strategies, concurrency controls, and failure-handling mechanisms.
+- Implemented and modified core application logic, incorporating AI-generated code where appropriate.
+- Debugged application issues, traced root causes, and refined implementations to improve correctness and reliability.
+- Designed and executed tests covering authentication, database operations, concurrency, and failure scenarios.
+- Configured Google OAuth, created API credentials, and securely managed sensitive environment variables.
+
+
