@@ -359,9 +359,6 @@ exactly that kind of reasoning about data modeling, concurrency and failure mode
 
 ## AI usage
 
-> **Draft for the author's review.** These bullets record what happened during development;
-> edit them into your own words before submitting.
-
 - Used an AI coding assistant (Claude) to scaffold the project, write the first drafts of
   modules, tests and this README, and run the lint/typecheck/test/build loop.
 - The AI proposed the architecture (DB lease vs. alternatives, cache = facts table,
