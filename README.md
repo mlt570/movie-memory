@@ -145,10 +145,7 @@ links stripped. `/api/fact` is `Cache-Control: private, no-store`.
 
 ## Why Variant A
 
-The hard parts of this app are backend correctness: defining "fresh", making sure a
-refresh-spamming user or five open tabs cause one OpenAI call rather than five, and degrading
-gracefully when a third-party API fails. These can be tested deterministically with a fake clock
-and a real database, which is exactly what Variant A asks for.
+I chose Variant A because I wanted to focus on backend reliability and correctness. It allowed me to explore how caching reduces unnecessary API calls, how concurrency protection prevents duplicate requests, and how the application handles failures without disrupting the user experience. These are practical challenges that come up when building reliable backend systems.
 
 ## Key tradeoffs
 
