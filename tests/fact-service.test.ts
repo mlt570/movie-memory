@@ -122,6 +122,30 @@ describe("burst / concurrency protection", () => {
     expect(await prisma.movieFact.count()).toBe(2);
   });
 
+  it("a request that got 'refreshing' gets the new fact from the cache once generation finishes", async () => {
+    const { service, generateFact, clock } = setup();
+    const user = await createUser("a@example.com");
+    const old = await service.getFactForUser(user.id);
+    clock.advance(FACT_CACHE_WINDOW_MS + 1);
+
+    const gate = deferred<string>();
+    generateFact.mockImplementation(() => gate.promise);
+    const generating = service.getFactForUser(user.id);
+    await new Promise((resolve) => setTimeout(resolve, 20)); // let it take the lock
+
+    const waiting = await service.getFactForUser(user.id);
+    expect(waiting).toMatchObject({ source: "refreshing", fact: { id: old.fact.id } });
+
+    gate.resolve("A brand new fact");
+    const generated = await generating;
+    const followUp = await service.getFactForUser(user.id); // the client's next poll
+
+    expect(followUp.source).toBe("cache");
+    expect(followUp.fact.id).toBe(generated.fact.id);
+    expect(followUp.fact.content).toBe("A brand new fact");
+    expect(generateFact).toHaveBeenCalledTimes(2);
+  });
+
   it("takes over an expired lock left behind by a crashed request", async () => {
     const { service, generateFact, clock } = setup();
     const user = await createUser("a@example.com");

@@ -1,68 +1,64 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
-import type { ApiErrorResponse, FactResponse } from "@/lib/api-types";
-
-type FactState =
-  | { status: "loading" }
-  | { status: "ready"; data: FactResponse }
-  | { status: "error"; message: string }
-  | { status: "unauthenticated" };
-
-const GENERIC_ERROR = "We couldn't load a fact right now. Please try again.";
-
-async function fetchFact(): Promise<FactState> {
-  try {
-    const res = await fetch("/api/fact", { cache: "no-store" });
-    if (res.status === 401) return { status: "unauthenticated" };
-    const body: unknown = await res.json().catch(() => null);
-    if (!res.ok) {
-      const message = (body as ApiErrorResponse | null)?.error?.message ?? GENERIC_ERROR;
-      return { status: "error", message };
-    }
-    return { status: "ready", data: body as FactResponse };
-  } catch {
-    return { status: "error", message: GENERIC_ERROR };
-  }
-}
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { FactResponse } from "@/lib/api-types";
+import { type FactState, fetchFact, isRefreshing, loadFact } from "./load-fact";
 
 const SOURCE_NOTE: Record<FactResponse["source"], string | null> = {
   generated: null,
   cache: "New facts are available once a minute. This is your latest one.",
-  refreshing: "A new fact is being written. Check back in a few seconds.",
+  refreshing: "A new fact is still being written. Try again in a moment.",
   stale: "We couldn't get a new fact just now, so here's your most recent one.",
 };
 
 export function FactCard() {
   const [state, setState] = useState<FactState>({ status: "loading" });
-  const [refreshing, setRefreshing] = useState(false);
+  const [busy, setBusy] = useState(true);
   const router = useRouter();
+  // Only the latest load may update the card. This also ignores the extra
+  // effect run React makes in development (Strict Mode) and loads that finish
+  // after unmount.
+  const latestLoad = useRef(0);
 
   // Session expired or signed out in another tab: back to the sign-in page.
   useEffect(() => {
     if (state.status === "unauthenticated") router.replace("/");
   }, [state.status, router]);
 
-  useEffect(() => {
-    let cancelled = false;
-    void fetchFact().then((next) => {
-      if (!cancelled) setState(next);
-    });
-    return () => {
-      cancelled = true;
-    };
+  const load = useCallback(async () => {
+    const id = ++latestLoad.current;
+    const isCancelled = () => latestLoad.current !== id;
+    await loadFact(fetchFact, setState, { isCancelled });
+    if (!isCancelled()) setBusy(false);
   }, []);
 
-  async function refresh() {
-    setRefreshing(true);
-    setState(await fetchFact());
-    setRefreshing(false);
+  useEffect(() => {
+    const loads = latestLoad;
+    void load();
+    return () => {
+      loads.current++; // cancel this load on unmount
+    };
+  }, [load]);
+
+  function refresh() {
+    setBusy(true);
+    void load();
   }
+
+  const note =
+    state.status !== "ready"
+      ? null
+      : busy
+        ? isRefreshing(state)
+          ? "Writing a new fact…"
+          : "Getting a new fact…"
+        : SOURCE_NOTE[state.data.source];
 
   return (
     <section
       aria-live="polite"
+      aria-busy={busy}
       className="rounded-2xl border border-amber-200 bg-amber-50 p-6 dark:border-amber-900/60 dark:bg-amber-950/30"
     >
       <div className="flex items-center justify-between gap-4">
@@ -73,10 +69,10 @@ export function FactCard() {
           <button
             type="button"
             onClick={refresh}
-            disabled={refreshing}
+            disabled={busy}
             className="rounded-full px-3 py-1 text-sm font-medium text-amber-900 transition hover:bg-amber-100 disabled:opacity-60 dark:text-amber-200 dark:hover:bg-amber-900/40"
           >
-            {refreshing ? "Loading…" : state.status === "error" ? "Try again" : "Another fact"}
+            {busy ? "Loading…" : state.status === "error" ? "Try again" : "Another fact"}
           </button>
         )}
       </div>
@@ -93,9 +89,11 @@ export function FactCard() {
 
       {state.status === "ready" && (
         <>
-          <p className="mt-3 text-lg leading-relaxed">{state.data.fact.content}</p>
-          {SOURCE_NOTE[state.data.source] && (
-            <p className="mt-3 text-sm text-stone-500">{SOURCE_NOTE[state.data.source]}</p>
+          <p className={`mt-3 text-lg leading-relaxed ${busy ? "opacity-60" : ""}`}>
+            {state.data.fact.content}
+          </p>
+          {note && (
+            <p className={`mt-3 text-sm text-stone-500 ${busy ? "animate-pulse" : ""}`}>{note}</p>
           )}
         </>
       )}

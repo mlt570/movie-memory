@@ -41,7 +41,7 @@ Migrations live in `prisma/migrations` (a single `init` migration). Tests apply 
 `TEST_DATABASE_URL` automatically.
 
 ```bash
-npm test            # 39 Vitest tests against a real Postgres test database
+npm test            # 45 Vitest tests against a real Postgres test database
 npm run lint        # ESLint
 npm run typecheck   # tsc --noEmit
 npm run build       # production build
@@ -132,7 +132,7 @@ links stripped. `/api/fact` is `Cache-Control: private, no-store`.
 
 ### Verification
 
-- **Automated:** 39 tests across the fact service, API route, onboarding action, validation and
+- **Automated:** 45 tests across the fact service, API route, fact card, onboarding action, validation and
   OpenAI output cleanup. They run on real Postgres because the guarantees depend on real
   unique violations and row locks. Deliberately breaking the cache comparison, the lock, the
   `userId` filter, the post-lock re-check or the token check each makes tests fail.
@@ -152,7 +152,7 @@ I chose Variant A because I wanted to focus on backend reliability and correctne
 - **DB lease over a simpler lock:** a few extra queries on a cache miss (none on a hit), in
   exchange for correctness across instances and recovery after crashes.
 - **Serve the previous fact during regeneration** instead of making concurrent requests wait.
-  Faster, but the new fact appears on the next request.
+  Faster; the fact card then polls and shows the new fact as soon as it is cached.
 - **Polling (500ms) over `LISTEN/NOTIFY`** for first-fact waiters: simpler and stateless.
 - **App clock for freshness and leases:** easy to fake in tests; assumes NTP-synced instances.
 - **Append-only facts:** simple invariants and free history, but unbounded growth.
